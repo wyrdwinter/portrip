@@ -1,0 +1,193 @@
+#!/usr/bin/sbcl --script
+
+(load "~/.sbclrc")
+
+(ql:quickload :apply-argv :silent t)
+(ql:quickload :split-sequence :silent t)
+(ql:quickload :uiop :silent t)
+(ql:quickload :arrows :silent t)
+(ql:quickload :drakma :silent t)
+(ql:quickload :lquery :silent t)
+(ql:quickload :str :silent t)
+
+(use-package (list :apply-argv
+                   :split-sequence
+                   :arrows
+                   :drakma
+                   :lquery))
+
+(defparameter *url-base* "https://nwn.sinfar.net")
+(defparameter *url-search* (concatenate 'string *url-base* "/search_characters.php?"))
+(defparameter *url-character* (concatenate 'string *url-base* "/character.php?"))
+(defparameter *url-portrait* (concatenate 'string *url-base* "/portraits_download_one.php?"))
+
+(defparameter *url-param-player-name* "&player_name=")
+(defparameter *url-param-character-name* "&char_name=")
+(defparameter *url-param-server-name* "&server=")
+(defparameter *url-param-pcid* "&pc_id=")
+(defparameter *url-param-resref* "&resref=")
+
+(defparameter *players* nil)
+(defparameter *characters* nil)
+(defparameter *directory* nil)
+
+(defun elt-last (sequence)
+  (elt sequence (- (length sequence) 1)))
+
+(defun filter-empty-vectors (vectors)
+  (remove-if (lambda (v) (equalp 0 (length v))) vectors))
+
+(defun safe-encode-url (url)
+  (str:replace-all " " "%20" url))
+
+(defstruct character-entry
+  plid
+  pcid
+  player-name
+  character-name
+  world
+  thumbnail
+  preview
+  last-seen)
+
+(defun extract-character-entry (tr)
+  (make-character-entry
+   :plid           (aref (lquery:$ tr "td:nth-child(1)"     (text))       0)
+   :pcid           (aref (lquery:$ tr "td:nth-child(2)"     (text))       0)
+   :player-name    (aref (lquery:$ tr "td:nth-child(3)"     (text))       0)
+   :character-name (aref (lquery:$ tr "td:nth-child(4)" "a" (text))       0)
+   :world          (aref (lquery:$ tr "td:nth-child(5)"     (text))       0)
+   :thumbnail      (aref (lquery:$ tr "td:nth-child(6)" "a" (attr :href)) 0)
+   :last-seen      (aref (lquery:$ tr "td:nth-child(7)"     (text))       0)))
+
+(defun extract-character-entries (document)
+  (map 'vector
+       'extract-character-entry
+       (lquery:$ document
+                 "table[id='tab_char_list']"
+                 "tbody"
+                 "tr")))
+
+(defun filter-by-player-name (entries name)
+  (remove-if-not
+   (lambda (entry)
+     (string-equal (character-entry-player-name entry) name)) entries))
+
+(defun filter-by-character-names (entries names)
+  (remove-if-not
+   (lambda (entry)
+     (member (character-entry-character-name entry)
+             names
+             :test #'string-equal))
+   entries))
+
+(defun extract-pcids (entries)
+  (map 'vector #'character-entry-pcid entries))
+
+(defun fetch-portrait-resrefs (pcids)
+  (map 'vector
+       (lambda (resref-path-v)
+         (elt-last (split-sequence #\= (aref resref-path-v 0))))
+       (filter-empty-vectors
+        (map 'vector
+             (lambda (pcid)
+               (multiple-value-bind
+                     (html rs headers)
+                   (http-request (safe-encode-url (concatenate 'string
+                                                               *url-character*
+                                                               *url-param-pcid*
+                                                               pcid)))
+                 (let* ((document (lquery:$ (initialize html)))
+                        (resref-paths (lquery:$ document
+                                                "div[id='character_portrait_container']"
+                                                "table"
+                                                "tr"
+                                                "th"
+                                                "a"
+                                                (attr :href))))
+                   resref-paths)))
+             pcids))))
+
+(defun fetch-portraits (resrefs)
+  (map 'vector
+       (lambda (resref)
+         (cons resref
+               (http-request
+                (safe-encode-url
+                 (concatenate 'string
+                              *url-portrait*
+                              *url-param-resref*
+                              resref)))))
+       resrefs))
+
+(defun save-portraits (portraits)
+  (ensure-directories-exist (concatenate 'string *directory* "/"))
+  (map 'vector
+       (lambda (portrait)
+         (with-open-file (file (concatenate 'string *directory* "/" (car portrait) ".7z")
+                               :direction :output
+                               :if-does-not-exist :create
+                               :if-exists :supersede
+                               :element-type '(unsigned-byte 8))
+           (write-sequence (cdr portrait) file)))
+       portraits))
+
+(defun error-usage ()
+  (format t "~A~%"
+          "Portrip: A Sinfar portrait downloader
+Usage: portrip [mandatory arguments] [optional arguments]
+
+mandatory arguments
+  --players=            one or more Neverwinter Nights player account names
+                         * e.g. \"Account\" or \"Account1;Account2;Account3\"
+
+optional arguments
+  --characters=         downloads specific portraits attached to the account
+                         * e.g. \"Char1;Char2;Char3\"
+                         * downloads all portraits when left unspecified
+                         * this argument is not accepted for multiple accounts
+  --directory=          the destination directory for portraits
+                         * defaults to current directory
+                         * creates directories if needed")
+  (sb-ext:exit :code 1))
+
+(defun main ()
+  (let* ((argv (parse-argv (cdr *posix-argv*)))
+         (argv-players (getf argv :players))
+         (argv-characters (getf argv :characters))
+         (argv-directory (getf argv :directory)))
+    (if argv-players (setf *players* (split-sequence #\; argv-players)) (error-usage))
+    (if argv-characters (setf *characters* (split-sequence #\; argv-characters)) (setf *characters* nil))
+    (if argv-directory (setf *directory* (uiop:native-namestring argv-directory)) (setf *directory* "."))
+    (if (and (> (length *players*) 1) *characters*) (error-usage))
+    (mapcar
+     (lambda (player)
+       (multiple-value-bind
+             (html rs headers)
+           (http-request (safe-encode-url (concatenate 'string
+                                                       *url-search*
+                                                       *url-param-player-name*
+                                                       player
+                                                       *url-param-server-name*
+                                                       "-1")))
+         (let ((document (lquery:$ (initialize html))))
+           (if *characters*
+               (-> document
+                   extract-character-entries
+                   (filter-by-player-name player)
+                   (filter-by-character-names *characters*)
+                   extract-pcids
+                   fetch-portrait-resrefs
+                   fetch-portraits
+                   save-portraits)
+               (-> document
+                   extract-character-entries
+                   (filter-by-player-name player)
+                   extract-pcids
+                   fetch-portrait-resrefs
+                   filter-empty-vectors
+                   fetch-portraits
+                   save-portraits)))))
+     *players*)))
+
+(main)
